@@ -1,0 +1,687 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════════════════
+//  SNIPER FLOW PROFILE  —  Volume Profile · TPO (time) · Tick flow · Delta flow
+// ───────────────────────────────────────────────────────────────────────────────────────
+//  What it does
+//   1. Builds an intraday session profile from INTRABAR data (lower timeframe), so every
+//      price row carries real buy volume, sell volume, delta and time-at-price (TPO).
+//   2. Tracks developing POC / VAH / VAL (volume), TPO POC (time), VWAP ±1σ,
+//      Initial Balance and the prior session's POC / VAH / VAL.
+//   3. Order flow per bar: delta (tick rule / body / close-location), session CVD,
+//      tick delta (upticks − downticks of intrabar prints), tick-activity surge (z-score),
+//      relative volume, absorption and CVD divergence.
+//   4. TREND INITIATION = price escapes balance (VAH/VAL, IB, prior VA) with initiative
+//      aggression confirmed by a 0-100 confluence score.
+//   5. SNIPER ENTRY = first pullback into the broken edge / VWAP / POC after initiation,
+//      with buyers (sellers) stepping back in or absorbing — stop, T1, T2 drawn and
+//      outcomes tracked live in the dashboard.
+//  Signals are confirmed on bar close (no repaint).
+// ═══════════════════════════════════════════════════════════════════════════════════════
+indicator("Sniper Flow Profile [VP · TPO · Tick · Delta]", shorttitle = "SniperFlow", overlay = true,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ─────────────────────────────── Inputs ───────────────────────────────
+const string G_SES = "① Session"
+const string G_PRO = "② Profile"
+const string G_FLO = "③ Order flow (intrabar)"
+const string G_SIG = "④ Initiation & sniper entries"
+const string G_VIS = "⑤ Visuals"
+
+bool   useCustomSess = input.bool(false, "Use custom session window", group = G_SES, tooltip = "Off = exchange day (resets on each new trading day). On = only the window below is profiled/traded, e.g. RTH 0930-1600.")
+string sessStr       = input.session("0930-1600", "Custom session", group = G_SES)
+string sessTz        = input.string("America/New_York", "Session timezone", group = G_SES)
+int    ibMinutes     = input.int(60, "Initial Balance length (minutes)", minval = 5, group = G_SES)
+
+int    rowTicks   = input.int(0, "Row size in ticks (0 = auto)", minval = 0, group = G_PRO)
+int    autoRows   = input.int(60, "Auto: rows per daily ATR", minval = 10, maxval = 400, group = G_PRO, tooltip = "Auto row height = yesterday's daily ATR ÷ this value, rounded to the tick.")
+float  vaPct      = input.float(70.0, "Value Area %", minval = 10, maxval = 95, group = G_PRO) / 100.0
+bool   showProf   = input.bool(true, "Draw session profile", group = G_PRO)
+string profMode   = input.string("Volume (Buy/Sell)", "Profile mode", options = ["Volume (Buy/Sell)", "Delta", "TPO (Time)"], group = G_PRO)
+int    profWidth  = input.int(60, "Profile width (bars)", minval = 10, maxval = 300, group = G_PRO)
+int    profOffset = input.int(8, "Profile offset from last bar", minval = 0, maxval = 150, group = G_PRO)
+int    maxRows    = input.int(90, "Max rows drawn", minval = 10, maxval = 200, group = G_PRO)
+bool   showDev    = input.bool(true, "Developing POC / VAH / VAL", group = G_PRO)
+bool   showTpoPoc = input.bool(true, "Developing TPO POC (time)", group = G_PRO)
+bool   showPrev   = input.bool(true, "Prior session POC / VAH / VAL", group = G_PRO)
+bool   showVwap   = input.bool(true, "Session VWAP ±1σ", group = G_PRO)
+bool   showIB     = input.bool(true, "Initial Balance high / low", group = G_PRO)
+
+bool   ltfAuto   = input.bool(true, "Auto intrabar timeframe", group = G_FLO, tooltip = "Auto: 1m intrabars on charts up to 1h (chart's own TF on ≤1m charts). For tick-like precision on 1m charts, turn Auto off and use 1S / 5S if your plan supports seconds.")
+string ltfManual = input.timeframe("1", "Manual intrabar timeframe", group = G_FLO)
+string deltaMeth = input.string("Tick Rule", "Delta classification", options = ["Tick Rule", "Candle Body", "Close Location"], group = G_FLO, tooltip = "Tick Rule: an intrabar is buy volume if it prints above the previous print (zero-tick inherits the last direction). Candle Body: close vs open. Close Location: buy share = (close-low)/(high-low).")
+int    rvolLen   = input.int(20, "Relative volume length", minval = 2, group = G_FLO)
+int    zLen      = input.int(20, "Tick-activity z-score length", minval = 5, group = G_FLO)
+int    atrLen    = input.int(14, "ATR length", minval = 1, group = G_FLO)
+
+int    minScore   = input.int(65, "Min initiation score (0-100)", minval = 0, maxval = 100, group = G_SIG)
+float  rvolMin    = input.float(1.3, "Min relative volume", minval = 0.1, step = 0.1, group = G_SIG)
+float  deltaMin   = input.float(15, "Min bar delta (% of volume)", minval = 0, maxval = 100, group = G_SIG) / 100.0
+int    warmBars   = input.int(3, "Ignore first N bars of session", minval = 0, group = G_SIG)
+bool   showInit   = input.bool(true, "Show trend-initiation markers", group = G_SIG)
+bool   showSniper = input.bool(true, "Show sniper entries + trade levels", group = G_SIG)
+int    entryWin   = input.int(24, "Retest window after initiation (bars)", minval = 1, group = G_SIG)
+int    maxEntries = input.int(2, "Max sniper entries per initiation", minval = 1, maxval = 10, group = G_SIG)
+float  tolAtr     = input.float(0.25, "Retest tolerance (× ATR)", minval = 0, step = 0.05, group = G_SIG)
+float  stopAtr    = input.float(0.20, "Stop buffer beyond level (× ATR)", minval = 0, step = 0.05, group = G_SIG)
+float  tp1R       = input.float(1.0, "Target 1 (R multiple)", minval = 0.1, step = 0.1, group = G_SIG)
+float  tp2R       = input.float(2.5, "Target 2 (R multiple)", minval = 0.1, step = 0.1, group = G_SIG)
+bool   moveBE     = input.bool(true, "Move stop to break-even after T1", group = G_SIG)
+bool   showMarks  = input.bool(true, "Show absorption & CVD divergence", group = G_SIG)
+
+color  bullCol   = input.color(#00E676, "Bull / buy", group = G_VIS)
+color  bearCol   = input.color(#FF1744, "Bear / sell", group = G_VIS)
+color  pocCol    = input.color(#FFD600, "POC", group = G_VIS)
+color  vaCol     = input.color(#2979FF, "Value area", group = G_VIS)
+color  tpoCol    = input.color(#00B8D4, "TPO", group = G_VIS)
+color  vwapCol   = input.color(#E040FB, "VWAP", group = G_VIS)
+color  ibCol     = input.color(#FF9100, "Initial Balance", group = G_VIS)
+bool   trendBg   = input.bool(true, "Tint background by trend state", group = G_VIS)
+bool   colorBars = input.bool(false, "Colour candles by delta", group = G_VIS)
+bool   showTable = input.bool(true, "Show dashboard", group = G_VIS)
+string tablePosI = input.string("Top Right", "Dashboard position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = G_VIS)
+
+// ─────────────────────────────── Helpers ───────────────────────────────
+// Value area: expand from POC toward the heavier neighbour until vaPct of the total is enclosed.
+f_va(map<int, float> m, int lo, int hi, int poc, float pct) =>
+    float total = 0.0
+    for k = lo to hi
+        total += nz(m.get(k))
+    int   up  = poc
+    int   dn  = poc
+    float acc = nz(m.get(poc))
+    float tgt = total * pct
+    while acc < tgt and (up < hi or dn > lo)
+        float vU = up < hi ? nz(m.get(up + 1)) : -1.0
+        float vD = dn > lo ? nz(m.get(dn - 1)) : -1.0
+        if vU >= vD
+            up  += 1
+            acc += vU
+        else
+            dn  -= 1
+            acc += vD
+    [up, dn]
+
+// Close crosses a level that existed BEFORE this bar (initiative break of a balance edge).
+f_xUp(series float lvl) =>
+    not na(lvl[1]) and close > lvl[1] and close[1] <= lvl[1]
+f_xDn(series float lvl) =>
+    not na(lvl[1]) and close < lvl[1] and close[1] >= lvl[1]
+
+f_ck(bool b) =>
+    b ? "✔" : "✘"
+
+f_fmtV(float v) =>
+    na(v) ? "—" : (v >= 0 ? "+" : "") + str.tostring(v, format.volume)
+
+// ─────────────────────────────── Data ───────────────────────────────
+float atr  = ta.atr(atrLen)
+float dAtr = request.security(syminfo.tickerid, "D", ta.atr(14)[1], lookahead = barmerge.lookahead_on)
+
+int    chartSec = timeframe.in_seconds(timeframe.period)
+string autoLtf  = chartSec <= 60 ? timeframe.period : chartSec <= 3600 ? "1" : chartSec <= 14400 ? "5" : "15"
+string ltf      = ltfAuto ? autoLtf : ltfManual
+
+[aO, aH, aL, aC, aV] = request.security_lower_tf(syminfo.tickerid, ltf, [open, high, low, close, volume], ignore_invalid_timeframe = true)
+
+bool inSess  = useCustomSess ? not na(time(timeframe.period, sessStr, sessTz)) : true
+bool dayChg  = timeframe.change("D")
+bool newSess = useCustomSess ? (inSess and (not inSess[1] or dayChg)) : dayChg
+
+// ─────────────────────────────── Session state ───────────────────────────────
+var map<int, float> mVol  = map.new<int, float>()
+var map<int, float> mBuy  = map.new<int, float>()
+var map<int, float> mSell = map.new<int, float>()
+var map<int, float> mTpo  = map.new<int, float>()
+
+var float binSize   = na
+var int   kMin      = na
+var int   kMax      = na
+var int   pocK      = na
+var float pocV      = 0.0
+var int   tpoK      = na
+var float tpoV      = 0.0
+var float sessVol   = 0.0
+var int   sessBar   = 0
+var int   sessStart = na
+var float ibH       = na
+var float ibL       = na
+var int   vaUpK     = na
+var int   vaDnK     = na
+var float dPoc      = na
+var float dVah      = na
+var float dVal      = na
+var float tPoc      = na
+var float pPoc      = na
+var float pVah      = na
+var float pVal      = na
+
+bool resetNow = newSess or na(binSize)
+if resetNow
+    if not na(dPoc)
+        pPoc := dPoc
+        pVah := dVah
+        pVal := dVal
+    mVol.clear()
+    mBuy.clear()
+    mSell.clear()
+    mTpo.clear()
+    float baseRange = na(dAtr) ? nz(atr, high - low) * 8.0 : dAtr
+    float rawBin    = rowTicks > 0 ? rowTicks * syminfo.mintick : baseRange / autoRows
+    binSize   := math.max(syminfo.mintick, math.round(rawBin / syminfo.mintick) * syminfo.mintick)
+    kMin      := na
+    kMax      := na
+    pocK      := na
+    pocV      := 0.0
+    tpoK      := na
+    tpoV      := 0.0
+    sessVol   := 0.0
+    sessBar   := 0
+    sessStart := time
+    ibH       := high
+    ibL       := low
+    vaUpK     := na
+    vaDnK     := na
+    dPoc      := na
+    dVah      := na
+    dVal      := na
+    tPoc      := na
+
+if inSess
+    sessBar += 1
+
+bool canBin = inSess and not na(binSize) and binSize > 0
+
+// ─────────────────────────────── Intrabar order-flow engine ───────────────────────────────
+var float lastC = na
+var int   lastD = 0
+
+int   nIn      = aC.size()
+bool  useChart = nIn == 0
+int   cnt      = useChart ? 1 : nIn
+float barBuy   = 0.0
+float barSell  = 0.0
+int   upT      = 0
+int   dnT      = 0
+float pc       = lastC
+int   pd       = lastD
+// Fallback to the chart bar itself when no intrabar data exists (deep history / no LTF access)
+array<float> oA = useChart ? array.from(open)   : aO
+array<float> hA = useChart ? array.from(high)   : aH
+array<float> lA = useChart ? array.from(low)    : aL
+array<float> cA = useChart ? array.from(close)  : aC
+array<float> vA = useChart ? array.from(volume) : aV
+
+for i = 0 to cnt - 1
+    float o = oA.get(i)
+    float h = hA.get(i)
+    float l = lA.get(i)
+    float c = cA.get(i)
+    float v = nz(vA.get(i))
+    if not na(c)
+        int dir = na(pc) ? (c > o ? 1 : c < o ? -1 : 0) : c > pc ? 1 : c < pc ? -1 : pd
+        if not na(pc)
+            if c > pc
+                upT += 1
+            else if c < pc
+                dnT += 1
+        float bf = switch deltaMeth
+            "Tick Rule"   => dir == 1 ? 1.0 : dir == -1 ? 0.0 : 0.5
+            "Candle Body" => c > o ? 1.0 : c < o ? 0.0 : dir == 1 ? 1.0 : dir == -1 ? 0.0 : 0.5
+            => h > l ? (c - l) / (h - l) : dir == 1 ? 1.0 : dir == -1 ? 0.0 : 0.5
+        float bv = v * bf
+        float sv = v - bv
+        barBuy  += bv
+        barSell += sv
+        pc := c
+        pd := dir
+        if canBin and v > 0 and not na(h) and not na(l)
+            int   k0 = math.floor(l / binSize)
+            int   k1 = math.min(math.floor(h / binSize), k0 + 400)
+            int   nb = k1 - k0 + 1
+            float vp = v / nb
+            float bp = bv / nb
+            float sp = sv / nb
+            for k = k0 to k1
+                float nv = nz(mVol.get(k)) + vp
+                mVol.put(k, nv)
+                mBuy.put(k, nz(mBuy.get(k)) + bp)
+                mSell.put(k, nz(mSell.get(k)) + sp)
+                if nv > pocV
+                    pocV := nv
+                    pocK := k
+            sessVol += v
+lastC := pc
+lastD := pd
+
+// TPO: one time-unit per chart bar on every price row the bar traded through
+if canBin
+    int r0 = math.floor(low / binSize)
+    int r1 = math.min(math.floor(high / binSize), r0 + 400)
+    for k = r0 to r1
+        float nt = nz(mTpo.get(k)) + 1.0
+        mTpo.put(k, nt)
+        if nt > tpoV
+            tpoV := nt
+            tpoK := k
+    kMin := na(kMin) ? r0 : math.min(kMin, r0)
+    kMax := na(kMax) ? r1 : math.max(kMax, r1)
+
+// Developing value area (volume; falls back to TPO on symbols without volume)
+if canBin and not na(kMin)
+    bool useVol = sessVol > 0 and not na(pocK)
+    int  pk     = useVol ? pocK : tpoK
+    if not na(pk)
+        int u = pk
+        int d = pk
+        if useVol
+            [u1, d1] = f_va(mVol, kMin, kMax, pk, vaPct)
+            u := u1
+            d := d1
+        else
+            [u2, d2] = f_va(mTpo, kMin, kMax, pk, vaPct)
+            u := u2
+            d := d2
+        vaUpK := u
+        vaDnK := d
+        dPoc  := (pk + 0.5) * binSize
+        dVah  := (u + 1) * binSize
+        dVal  := d * binSize
+    if not na(tpoK)
+        tPoc := (tpoK + 0.5) * binSize
+
+// Initial Balance
+bool ibDone = not na(sessStart) and time >= sessStart + ibMinutes * 60000
+if inSess and not resetNow and not ibDone
+    ibH := math.max(ibH, high)
+    ibL := math.min(ibL, low)
+
+// VWAP
+[vwap, vwUp, vwDn] = ta.vwap(hlc3, newSess, 1.0)
+
+// ─────────────────────────────── Flow metrics ───────────────────────────────
+float barVol = barBuy + barSell
+float delta  = barBuy - barSell
+float dPct   = barVol > 0 ? delta / barVol : 0.0
+
+var float cvd = 0.0
+cvd := resetNow ? delta : inSess ? cvd + delta : cvd
+
+int tickDelta = upT - dnT
+int tickAct   = upT + dnT
+var int cTick = 0
+cTick := resetNow ? tickDelta : inSess ? cTick + tickDelta : cTick
+
+float volMa = ta.sma(barVol, rvolLen)
+float rvol  = volMa > 0 ? barVol / volMa : 0.0
+float actMa = ta.sma(float(tickAct), zLen)
+float actSd = ta.stdev(float(tickAct), zLen)
+float actZ  = actSd > 0 ? (tickAct - actMa) / actSd : 0.0
+float dEma  = ta.ema(delta, 5)
+float clv   = high > low ? (close - low) / (high - low) : 0.5
+
+// CVD divergence at new session extremes (exhaustion warning)
+var float sesHi = na
+var float sesLo = na
+var float cvdHi = na
+var float cvdLo = na
+bool bearDiv = false
+bool bullDiv = false
+if resetNow
+    sesHi := high
+    sesLo := low
+    cvdHi := cvd
+    cvdLo := cvd
+else if inSess
+    if high > sesHi
+        bearDiv := sessBar > warmBars and cvd < cvdHi
+        sesHi   := high
+        cvdHi   := cvd
+    if low < sesLo
+        bullDiv := sessBar > warmBars and cvd > cvdLo
+        sesLo   := low
+        cvdLo   := cvd
+
+// Absorption: heavy volume, tiny range, aggressor failed to move price
+bool absBull = inSess and rvol >= 2.0 and (high - low) <= atr * 0.6 and dPct <= -0.2 and clv >= 0.5
+bool absBear = inSess and rvol >= 2.0 and (high - low) <= atr * 0.6 and dPct >= 0.2 and clv <= 0.5
+
+// ─────────────────────────────── Trend initiation ───────────────────────────────
+float dVah1 = dVah[1]
+float dVal1 = dVal[1]
+float ibH1  = ibH[1]
+float ibL1  = ibL[1]
+float pVah1 = pVah[1]
+float pVal1 = pVal[1]
+
+bool xVah  = f_xUp(dVah)
+bool xIbH  = f_xUp(ibH)
+bool xPVah = f_xUp(pVah)
+bool xVal  = f_xDn(dVal)
+bool xIbL  = f_xDn(ibL)
+bool xPVal = f_xDn(pVal)
+
+bool ibUp = ibDone and close > ibH
+bool ibDn = ibDone and close < ibL
+
+int bullScore = (close > dVah1 ? 25 : 0) + (close > vwap ? 10 : 0) + (rvol >= rvolMin ? 15 : 0) + (dPct >= deltaMin ? 15 : 0) + (dEma > 0 ? 10 : 0) + (tickDelta > 0 ? 10 : 0) + (actZ >= 1.0 ? 5 : 0) + (ibUp ? 10 : 0)
+int bearScore = (close < dVal1 ? 25 : 0) + (close < vwap ? 10 : 0) + (rvol >= rvolMin ? 15 : 0) + (dPct <= -deltaMin ? 15 : 0) + (dEma < 0 ? 10 : 0) + (tickDelta < 0 ? 10 : 0) + (actZ >= 1.0 ? 5 : 0) + (ibDn ? 10 : 0)
+
+bool bullEdge = xVah or (ibDone and xIbH) or xPVah
+bool bearEdge = xVal or (ibDone and xIbL) or xPVal
+
+var int trend = 0
+bool sigOK    = inSess and sessBar > warmBars and barstate.isconfirmed and timeframe.isintraday
+bool bullInit = sigOK and trend != 1 and bullEdge and bullScore >= minScore and dPct > 0 and close > vwap
+bool bearInit = sigOK and trend != -1 and bearEdge and bearScore >= minScore and dPct < 0 and close < vwap
+
+var int   initBar     = na
+var float initLvl     = na
+var int   entriesUsed = 0
+
+if resetNow
+    trend   := 0
+    initBar := na
+    initLvl := na
+if bullInit
+    trend       := 1
+    initBar     := bar_index
+    initLvl     := xVah ? dVah1 : xIbH ? ibH1 : pVah1
+    entriesUsed := 0
+else if bearInit
+    trend       := -1
+    initBar     := bar_index
+    initLvl     := xVal ? dVal1 : xIbL ? ibL1 : pVal1
+    entriesUsed := 0
+else if barstate.isconfirmed
+    // Initiative fails when price is accepted back through POC and VWAP
+    if trend == 1 and close < dPoc and close < vwap
+        trend := 0
+    else if trend == -1 and close > dPoc and close > vwap
+        trend := 0
+
+if showInit and bullInit
+    label.new(bar_index, low, "INIT ▲ " + str.tostring(bullScore), yloc = yloc.belowbar, style = label.style_label_up, color = color.new(bullCol, 35), textcolor = color.white, size = size.small,
+         tooltip = "Bull trend initiation · score " + str.tostring(bullScore) + "/100" + "\nClose > VAH: " + f_ck(close > dVah1) + "\nClose > VWAP: " + f_ck(close > vwap) + "\nRVOL ≥ min: " + f_ck(rvol >= rvolMin) + " (" + str.tostring(rvol, "#.##") + ")" + "\nDelta ≥ min: " + f_ck(dPct >= deltaMin) + " (" + str.tostring(dPct * 100, "#.#") + "%)" + "\nDelta momentum: " + f_ck(dEma > 0) + "\nTick Δ > 0: " + f_ck(tickDelta > 0) + " (" + str.tostring(tickDelta) + ")" + "\nTick surge: " + f_ck(actZ >= 1.0) + "\nIB breakout: " + f_ck(ibUp))
+if showInit and bearInit
+    label.new(bar_index, high, "INIT ▼ " + str.tostring(bearScore), yloc = yloc.abovebar, style = label.style_label_down, color = color.new(bearCol, 35), textcolor = color.white, size = size.small,
+         tooltip = "Bear trend initiation · score " + str.tostring(bearScore) + "/100" + "\nClose < VAL: " + f_ck(close < dVal1) + "\nClose < VWAP: " + f_ck(close < vwap) + "\nRVOL ≥ min: " + f_ck(rvol >= rvolMin) + " (" + str.tostring(rvol, "#.##") + ")" + "\nDelta ≤ -min: " + f_ck(dPct <= -deltaMin) + " (" + str.tostring(dPct * 100, "#.#") + "%)" + "\nDelta momentum: " + f_ck(dEma < 0) + "\nTick Δ < 0: " + f_ck(tickDelta < 0) + " (" + str.tostring(tickDelta) + ")" + "\nTick surge: " + f_ck(actZ >= 1.0) + "\nIB breakdown: " + f_ck(ibDn))
+
+// ─────────────────────────────── Trade management ───────────────────────────────
+var int   tradeDir = 0
+var float tE       = na
+var float tS       = na
+var float t1       = na
+var float t2       = na
+var bool  t1Hit    = false
+var int   tBar     = na
+var line  lnE      = na
+var line  lnS      = na
+var line  lnT1     = na
+var line  lnT2     = na
+var int   nTr      = 0
+var int   nClosed  = 0
+var int   nT1      = 0
+var int   nT2      = 0
+var int   nSL      = 0
+
+if tradeDir != 0
+    bool   closeIt = false
+    if resetNow
+        closeIt := true
+    else if (tradeDir == 1 and bearInit) or (tradeDir == -1 and bullInit)
+        closeIt := true
+    else if bar_index > tBar
+        if tradeDir == 1
+            if low <= tS
+                closeIt := true
+                if not t1Hit
+                    nSL += 1
+            else if high >= t2
+                if not t1Hit
+                    nT1 += 1
+                nT2     += 1
+                closeIt := true
+            else if not t1Hit and high >= t1
+                t1Hit := true
+                nT1   += 1
+                if moveBE
+                    tS := tE
+                    if showSniper
+                        lnS.set_y1(tE)
+                        lnS.set_y2(tE)
+        else
+            if high >= tS
+                closeIt := true
+                if not t1Hit
+                    nSL += 1
+            else if low <= t2
+                if not t1Hit
+                    nT1 += 1
+                nT2     += 1
+                closeIt := true
+            else if not t1Hit and low <= t1
+                t1Hit := true
+                nT1   += 1
+                if moveBE
+                    tS := tE
+                    if showSniper
+                        lnS.set_y1(tE)
+                        lnS.set_y2(tE)
+    if showSniper
+        lnE.set_x2(bar_index)
+        lnS.set_x2(bar_index)
+        lnT1.set_x2(bar_index)
+        lnT2.set_x2(bar_index)
+    if closeIt
+        tradeDir := 0
+        nClosed  += 1
+
+// ─────────────────────────────── Sniper entries ───────────────────────────────
+float tol = nz(atr) * tolAtr
+f_touchL(float lvl) =>
+    not na(lvl) and low <= lvl + tol and close > lvl
+f_touchH(float lvl) =>
+    not na(lvl) and high >= lvl - tol and close < lvl
+
+int barsSinceInit = na(initBar) ? 999999 : bar_index - initBar
+bool armed = sigOK and tradeDir == 0 and barsSinceInit >= 1 and barsSinceInit <= entryWin and entriesUsed < maxEntries
+
+float  bullLvl  = f_touchL(initLvl) ? initLvl : f_touchL(vwap) ? vwap : f_touchL(dPoc) ? dPoc : f_touchL(dVah) ? dVah : na
+string bullName = f_touchL(initLvl) ? "Broken edge" : f_touchL(vwap) ? "VWAP" : f_touchL(dPoc) ? "dPOC" : f_touchL(dVah) ? "dVAH" : ""
+float  bearLvl  = f_touchH(initLvl) ? initLvl : f_touchH(vwap) ? vwap : f_touchH(dPoc) ? dPoc : f_touchH(dVal) ? dVal : na
+string bearName = f_touchH(initLvl) ? "Broken edge" : f_touchH(vwap) ? "VWAP" : f_touchH(dPoc) ? "dPOC" : f_touchH(dVal) ? "dVAL" : ""
+
+// Buyers step back in (positive delta) OR sellers are absorbed (negative delta but close holds the top)
+bool bullConfirm = close > open and clv >= 0.6 and (delta > 0 or (rvol >= 1.0 and clv >= 0.7))
+bool bearConfirm = close < open and clv <= 0.4 and (delta < 0 or (rvol >= 1.0 and clv <= 0.3))
+
+bool bullSniper = armed and trend == 1 and not na(bullLvl) and bullConfirm
+bool bearSniper = armed and trend == -1 and not na(bearLvl) and bearConfirm
+
+bool longFired  = false
+bool shortFired = false
+
+if bullSniper or bearSniper
+    int dir = bullSniper ? 1 : -1
+    tradeDir := dir
+    tE       := close
+    tS       := dir == 1 ? math.min(low, bullLvl) - nz(atr) * stopAtr : math.max(high, bearLvl) + nz(atr) * stopAtr
+    float r = math.abs(tE - tS)
+    t1          := tE + dir * r * tp1R
+    t2          := tE + dir * r * tp2R
+    t1Hit       := false
+    tBar        := bar_index
+    entriesUsed += 1
+    nTr         += 1
+    longFired   := dir == 1
+    shortFired  := dir == -1
+    if showSniper
+        color dc = dir == 1 ? bullCol : bearCol
+        lnE  := line.new(bar_index, tE, bar_index + 1, tE, color = color.new(color.white, 15), width = 2)
+        lnS  := line.new(bar_index, tS, bar_index + 1, tS, color = bearCol, style = line.style_dashed, width = 1)
+        lnT1 := line.new(bar_index, t1, bar_index + 1, t1, color = color.new(bullCol, 30), style = line.style_dotted, width = 1)
+        lnT2 := line.new(bar_index, t2, bar_index + 1, t2, color = bullCol, width = 1)
+        string tip = (dir == 1 ? "LONG" : "SHORT") + " @ " + str.tostring(tE, format.mintick) + "\nRetest of: " + (dir == 1 ? bullName : bearName) + "\nStop: " + str.tostring(tS, format.mintick) + "\nT1 (" + str.tostring(tp1R) + "R): " + str.tostring(t1, format.mintick) + "\nT2 (" + str.tostring(tp2R) + "R): " + str.tostring(t2, format.mintick) + "\nBar Δ: " + f_fmtV(delta) + " (" + str.tostring(dPct * 100, "#.#") + "%)" + "\nTick Δ: " + str.tostring(tickDelta)
+        if dir == 1
+            label.new(bar_index, low, "🎯 LONG", yloc = yloc.belowbar, style = label.style_label_up, color = dc, textcolor = color.black, size = size.normal, tooltip = tip)
+        else
+            label.new(bar_index, high, "🎯 SHORT", yloc = yloc.abovebar, style = label.style_label_down, color = dc, textcolor = color.white, size = size.normal, tooltip = tip)
+
+// ─────────────────────────────── Plots ───────────────────────────────
+bool plotOK = inSess and not resetNow
+pPocPl = plot(showDev and plotOK ? dPoc : na, "Developing POC", pocCol, 2, plot.style_linebr)
+pVahPl = plot(showDev and plotOK ? dVah : na, "Developing VAH", color.new(vaCol, 10), 1, plot.style_linebr)
+pValPl = plot(showDev and plotOK ? dVal : na, "Developing VAL", color.new(vaCol, 10), 1, plot.style_linebr)
+fill(pVahPl, pValPl, color.new(vaCol, 93), "Value area fill")
+plot(showTpoPoc and plotOK ? tPoc : na, "TPO POC (time)", color.new(tpoCol, 20), 1, plot.style_circles)
+plot(showPrev and plotOK ? pPoc : na, "Prior POC", color.new(pocCol, 45), 1, plot.style_linebr)
+plot(showPrev and plotOK ? pVah : na, "Prior VAH", color.new(vaCol, 55), 1, plot.style_linebr)
+plot(showPrev and plotOK ? pVal : na, "Prior VAL", color.new(vaCol, 55), 1, plot.style_linebr)
+plot(showVwap and plotOK ? vwap : na, "VWAP", vwapCol, 2, plot.style_linebr)
+plot(showVwap and plotOK ? vwUp : na, "VWAP +1σ", color.new(vwapCol, 65), 1, plot.style_linebr)
+plot(showVwap and plotOK ? vwDn : na, "VWAP -1σ", color.new(vwapCol, 65), 1, plot.style_linebr)
+plot(showIB and plotOK ? ibH : na, "IB high", color.new(ibCol, 30), 1, plot.style_linebr)
+plot(showIB and plotOK ? ibL : na, "IB low", color.new(ibCol, 30), 1, plot.style_linebr)
+
+plotshape(showMarks and absBull and barstate.isconfirmed, "Bullish absorption", shape.diamond, location.belowbar, color.new(bullCol, 20), size = size.tiny)
+plotshape(showMarks and absBear and barstate.isconfirmed, "Bearish absorption", shape.diamond, location.abovebar, color.new(bearCol, 20), size = size.tiny)
+plotshape(showMarks and bearDiv and barstate.isconfirmed, "Bearish CVD divergence", shape.xcross, location.abovebar, color.new(color.orange, 0), size = size.tiny, text = "Δdiv")
+plotshape(showMarks and bullDiv and barstate.isconfirmed, "Bullish CVD divergence", shape.xcross, location.belowbar, color.new(color.aqua, 0), size = size.tiny, text = "Δdiv")
+
+bgcolor(trendBg and inSess ? (trend == 1 ? color.new(bullCol, 93) : trend == -1 ? color.new(bearCol, 93) : na) : na, title = "Trend background")
+barcolor(colorBars ? color.from_gradient(dPct, -0.6, 0.6, bearCol, bullCol) : na, title = "Delta candles")
+
+// ─────────────────────────────── Session profile drawing ───────────────────────────────
+var array<box>   profBoxes  = array.new<box>()
+var array<line>  profLines  = array.new<line>()
+var array<label> profLabels = array.new<label>()
+
+if barstate.islast
+    for b in profBoxes
+        b.delete()
+    profBoxes.clear()
+    for ln in profLines
+        ln.delete()
+    profLines.clear()
+    for lb in profLabels
+        lb.delete()
+    profLabels.clear()
+    if showProf and not na(kMin) and not na(kMax) and not na(binSize)
+        bool tpoMode = profMode == "TPO (Time)"
+        bool dMode   = profMode == "Delta"
+        int  nBins   = kMax - kMin + 1
+        int  grp     = math.max(1, math.ceil(nBins / float(maxRows)))
+        int  nG      = math.ceil(nBins / float(grp))
+        array<float> gV = array.new<float>(nG, 0.0)
+        array<float> gB = array.new<float>(nG, 0.0)
+        array<float> gS = array.new<float>(nG, 0.0)
+        array<float> gT = array.new<float>(nG, 0.0)
+        float gMax = 0.0
+        for g = 0 to nG - 1
+            float sV = 0.0
+            float sB = 0.0
+            float sS = 0.0
+            float sT = 0.0
+            for j = 0 to grp - 1
+                int k = kMin + g * grp + j
+                if k <= kMax
+                    sV += nz(mVol.get(k))
+                    sB += nz(mBuy.get(k))
+                    sS += nz(mSell.get(k))
+                    sT += nz(mTpo.get(k))
+            gV.set(g, sV)
+            gB.set(g, sB)
+            gS.set(g, sS)
+            gT.set(g, sT)
+            float m = tpoMode ? sT : dMode ? math.abs(sB - sS) : sV
+            gMax := math.max(gMax, m)
+        if gMax > 0
+            int x0    = bar_index + profOffset
+            int hiliK = tpoMode ? tpoK : pocK
+            for g = 0 to nG - 1
+                float sV  = gV.get(g)
+                float sB  = gB.get(g)
+                float sS  = gS.get(g)
+                float m   = tpoMode ? gT.get(g) : dMode ? math.abs(sB - sS) : sV
+                int   len = math.round(m / gMax * profWidth)
+                if len >= 1
+                    int   kLo   = kMin + g * grp
+                    int   kHi   = math.min(kLo + grp - 1, kMax)
+                    float yB    = kLo * binSize
+                    float yT    = (kHi + 1) * binSize
+                    bool  isPoc = not na(hiliK) and hiliK >= kLo and hiliK <= kHi
+                    bool  inVA  = not na(vaUpK) and kHi >= vaDnK and kLo <= vaUpK
+                    int   tr    = isPoc ? 0 : inVA ? 30 : 65
+                    color noBdr = color.new(color.black, 100)
+                    if tpoMode
+                        profBoxes.push(box.new(x0, yT, x0 + len, yB, border_color = noBdr, border_width = 0, bgcolor = color.new(isPoc ? pocCol : tpoCol, tr)))
+                    else if dMode
+                        profBoxes.push(box.new(x0, yT, x0 + len, yB, border_color = noBdr, border_width = 0, bgcolor = color.new(isPoc ? pocCol : sB >= sS ? bullCol : bearCol, tr)))
+                    else
+                        int bl = math.round(len * (sV > 0 ? sB / sV : 0.5))
+                        if bl > 0
+                            profBoxes.push(box.new(x0, yT, x0 + bl, yB, border_color = noBdr, border_width = 0, bgcolor = color.new(isPoc ? pocCol : bullCol, tr)))
+                        if len - bl > 0
+                            profBoxes.push(box.new(x0 + bl, yT, x0 + len, yB, border_color = noBdr, border_width = 0, bgcolor = color.new(isPoc ? pocCol : bearCol, isPoc ? 35 : tr)))
+            int xR = x0 + profWidth
+            if not na(dPoc)
+                profLines.push(line.new(x0, dPoc, xR, dPoc, color = pocCol, width = 2))
+                profLabels.push(label.new(xR, dPoc, "POC " + str.tostring(dPoc, format.mintick), style = label.style_label_left, color = color.new(color.black, 100), textcolor = pocCol, size = size.small))
+            if not na(dVah)
+                profLines.push(line.new(x0, dVah, xR, dVah, color = vaCol, style = line.style_dashed))
+                profLabels.push(label.new(xR, dVah, "VAH " + str.tostring(dVah, format.mintick), style = label.style_label_left, color = color.new(color.black, 100), textcolor = vaCol, size = size.small))
+            if not na(dVal)
+                profLines.push(line.new(x0, dVal, xR, dVal, color = vaCol, style = line.style_dashed))
+                profLabels.push(label.new(xR, dVal, "VAL " + str.tostring(dVal, format.mintick), style = label.style_label_left, color = color.new(color.black, 100), textcolor = vaCol, size = size.small))
+            float topY = (kMax + 1) * binSize
+            profLabels.push(label.new(x0, topY, "Session " + profMode + " · Σ " + str.tostring(sessVol, format.volume) + " · CVD " + f_fmtV(cvd), style = label.style_label_lower_left, color = color.new(color.black, 100), textcolor = color.silver, size = size.small))
+
+// ─────────────────────────────── Dashboard ───────────────────────────────
+string tPos = switch tablePosI
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_right
+var table tbl = table.new(tPos, 2, 15, bgcolor = color.new(#0B0E14, 8), border_color = color.new(color.gray, 75), border_width = 1, frame_color = color.new(color.gray, 50), frame_width = 1)
+
+f_row(int r, string k, string v, color vc) =>
+    table.cell(tbl, 0, r, k, text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, r, v, text_color = vc, text_size = size.small, text_halign = text.align_right)
+
+if showTable and barstate.islast
+    color nCol = color.silver
+    table.cell(tbl, 0, 0, "🎯 SNIPER FLOW", text_color = color.white, text_size = size.normal, text_halign = text.align_left)
+    table.cell(tbl, 1, 0, syminfo.ticker + " · " + timeframe.period, text_color = color.gray, text_size = size.small, text_halign = text.align_right)
+    string tTxt = trend == 1 ? "BULL INITIATIVE ▲" : trend == -1 ? "BEAR INITIATIVE ▼" : "BALANCE / ROTATION"
+    f_row(1, "Trend state", tTxt, trend == 1 ? bullCol : trend == -1 ? bearCol : nCol)
+    f_row(2, "Score bull / bear", str.tostring(bullScore) + " / " + str.tostring(bearScore), bullScore >= minScore ? bullCol : bearScore >= minScore ? bearCol : nCol)
+    string loc = na(dVah) ? "—" : close > dVah ? "ABOVE VALUE" : close < dVal ? "BELOW VALUE" : "INSIDE VALUE"
+    f_row(3, "Location", loc, close > dVah ? bullCol : close < dVal ? bearCol : nCol)
+    f_row(4, "vs VWAP", close > vwap ? "Above" : "Below", close > vwap ? bullCol : bearCol)
+    f_row(5, "Bar Δ (Δ%)", f_fmtV(delta) + "  (" + str.tostring(dPct * 100, "#.#") + "%)", delta >= 0 ? bullCol : bearCol)
+    f_row(6, "Session CVD", f_fmtV(cvd), cvd >= 0 ? bullCol : bearCol)
+    f_row(7, "Tick Δ / cum", str.tostring(tickDelta) + " / " + str.tostring(cTick), tickDelta >= 0 ? bullCol : bearCol)
+    f_row(8, "Tick activity z", str.tostring(actZ, "#.##"), actZ >= 1.0 ? pocCol : nCol)
+    f_row(9, "RVOL", str.tostring(rvol, "#.##") + "x", rvol >= rvolMin ? pocCol : nCol)
+    string ibTxt = not ibDone ? "Forming" : close > ibH ? "Broken UP" : close < ibL ? "Broken DOWN" : "Inside"
+    f_row(10, "Initial Balance", ibTxt, close > ibH and ibDone ? bullCol : close < ibL and ibDone ? bearCol : nCol)
+    f_row(11, "POC · VAH · VAL", str.tostring(dPoc, format.mintick) + " · " + str.tostring(dVah, format.mintick) + " · " + str.tostring(dVal, format.mintick), pocCol)
+    string sTxt = tradeDir == 1 ? "LONG @ " + str.tostring(tE, format.mintick) + (t1Hit ? " (T1 ✔)" : "") : tradeDir == -1 ? "SHORT @ " + str.tostring(tE, format.mintick) + (t1Hit ? " (T1 ✔)" : "") : trend != 0 and barsSinceInit <= entryWin and entriesUsed < maxEntries ? (trend == 1 ? "Armed: wait LONG retest" : "Armed: wait SHORT retest") : "Flat — no setup"
+    f_row(12, "Sniper", sTxt, tradeDir == 1 ? bullCol : tradeDir == -1 ? bearCol : nCol)
+    string stTxt = str.tostring(nTr) + " trades · T1 " + (nClosed > 0 ? str.tostring(100.0 * nT1 / nClosed, "#") + "%" : "—") + " · T2 " + str.tostring(nT2) + " · SL " + str.tostring(nSL)
+    f_row(13, "Hit rate (chart)", stTxt, nCol)
+    string ltfTxt = (useChart ? "chart bars (no intrabar data)" : str.tostring(cnt) + " × " + ltf) + (timeframe.isintraday ? "" : " · USE INTRADAY TF")
+    f_row(14, "Intrabars / bar", ltfTxt, useChart or not timeframe.isintraday ? bearCol : nCol)
+
+// ─────────────────────────────── Alerts ───────────────────────────────
+alertcondition(bullInit, "Bull trend initiation", "SniperFlow ▲ BULL initiation on {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(bearInit, "Bear trend initiation", "SniperFlow ▼ BEAR initiation on {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(longFired, "Sniper LONG", "SniperFlow 🎯 LONG on {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(shortFired, "Sniper SHORT", "SniperFlow 🎯 SHORT on {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(bearDiv or bullDiv, "CVD divergence", "SniperFlow Δ divergence on {{ticker}} ({{interval}}) @ {{close}}")
+
+if longFired or shortFired
+    alert("SniperFlow " + (longFired ? "LONG" : "SHORT") + " " + syminfo.ticker + " @ " + str.tostring(tE, format.mintick) + " | SL " + str.tostring(tS, format.mintick) + " | T1 " + str.tostring(t1, format.mintick) + " | T2 " + str.tostring(t2, format.mintick), alert.freq_once_per_bar_close)
+if bullInit or bearInit
+    alert("SniperFlow " + (bullInit ? "BULL" : "BEAR") + " initiation " + syminfo.ticker + " @ " + str.tostring(close, format.mintick) + " | score " + str.tostring(bullInit ? bullScore : bearScore), alert.freq_once_per_bar_close)
